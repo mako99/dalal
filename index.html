@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Dalal — Stock Analysis for the Indian Market</title>
+<meta name="description" content="Analyse Indian stocks beautifully. Five years of performance, deep fundamentals, screener, side-by-side compare and more."/>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%231d1d1f'/><path d='M24 66 L44 46 L57 56 L78 30' stroke='%2330d158' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>"/>
+<link rel="stylesheet" href="css/styles.css"/>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="nav-logo" href="#/" aria-label="Dalal home">
+      <svg width="20" height="20" viewBox="0 0 100 100" fill="none">
+        <rect width="100" height="100" rx="24" fill="currentColor"/>
+        <path d="M24 66 L44 46 L57 56 L78 30" stroke="#30d158" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>Dalal</span>
+    </a>
+    <div class="nav-links">
+      <a href="#/" data-nav="overview">Overview</a>
+      <a href="#/screener" data-nav="screener">Screener</a>
+      <a href="#/compare" data-nav="compare">Compare</a>
+      <a href="#/watchlist" data-nav="watchlist">Watchlist</a>
+    </div>
+    <div class="search-wrap">
+      <svg class="search-ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      <input id="navSearch" type="text" placeholder="Search stocks" autocomplete="off" spellcheck="false"/>
+      <div class="search-panel" id="navSearchPanel"></div>
+    </div>
+  </div>
+</nav>
+
+<div class="ticker" id="ticker" aria-hidden="true"></div>
+
+<main id="app"></main>
+
+<footer class="footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <div class="footer-logo">
+          <svg width="26" height="26" viewBox="0 0 100 100" fill="none">
+            <rect width="100" height="100" rx="24" fill="#1d1d1f"/>
+            <path d="M24 66 L44 46 L57 56 L78 30" stroke="#30d158" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span>Dalal</span>
+        </div>
+        <p>Stock analysis, reimagined.<br/>Built for the Indian market.</p>
+      </div>
+      <div class="footer-col">
+        <h4>Explore</h4>
+        <a href="#/">Market Overview</a>
+        <a href="#/screener">Stock Screener</a>
+        <a href="#/compare">Compare Stocks</a>
+        <a href="#/watchlist">My Watchlist</a>
+      </div>
+      <div class="footer-col">
+        <h4>Markets</h4>
+        <a href="https://www.nseindia.com" target="_blank" rel="noopener">NSE India</a>
+        <a href="https://www.bseindia.com" target="_blank" rel="noopener">BSE India</a>
+        <a href="https://www.sebi.gov.in" target="_blank" rel="noopener">SEBI</a>
+        <a href="https://www.rbi.org.in" target="_blank" rel="noopener">RBI</a>
+      </div>
+      <div class="footer-col">
+        <h4>Good to know</h4>
+        <p class="footer-note">Prices update in real time via the bundled <b>server.py</b> (Yahoo Finance proxy) when served with it. Fundamentals & financials remain illustrative demo data.</p>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 Dalal. Designed in India.</span>
+      <span>Nothing here is investment advice. Please consult a SEBI-registered advisor.</span>
+    </div>
+  </div>
+</footer>
+
+<script src="js/universe_nse.js" defer></script>
+<script src="js/data.js" defer></script>
+<script src="js/charts.js" defer></script>
+<script src="js/app.js" defer></script>
+<script src="js/live.js" defer></script>
+</body>
+</html>
