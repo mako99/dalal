@@ -1,0 +1,43 @@
+name: Refresh snapshot data
+
+# GitHub Pages serves static files only, so the numbers it shows come from
+# js/snapshot.js — a file this workflow regenerates on a schedule by running
+# the same fetcher server.py uses locally.
+on:
+  schedule:
+    - cron: "17 */2 * * *"        # every 2 hours, off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch quotes + 5y history from Yahoo Finance
+        id: fetch
+        continue-on-error: true      # Yahoo may rate-limit; keep the old file
+        run: python3 server.py --snapshot --history
+
+      - name: Commit the new snapshot
+        run: |
+          git config user.name  "dalal-snapshot-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add js/snapshot.js || true
+          if git diff --cached --quiet; then
+            echo "snapshot.js unchanged — nothing to push"
+          else
+            git commit -m "data: refresh js/snapshot.js [skip ci]"
+            git push
+          fi

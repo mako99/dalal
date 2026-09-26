@@ -4,9 +4,10 @@ A fast, single-page stock-analysis website for Indian large caps, designed with
 an Apple-inspired visual language (SF system fonts, translucent nav, hero
 gradients, pill buttons, hairline cards).
 
-> **Data notice** — with `server.py` running, *prices* update in real time
-> from Yahoo Finance. Fundamentals, financials and analyst notes remain
-> *illustrative* demo data. Not investment advice.
+> **Data notice** — prices and 5-year charts come from **real Yahoo Finance
+> data** (live through `server.py`, or from the committed `js/snapshot.js`).
+> Fundamentals, financials and analyst notes remain *illustrative* demo data.
+> Not investment advice.
 
 ## Run it
 
@@ -15,16 +16,47 @@ Option 1 — with live data (recommended):
     python3 server.py
     # open http://localhost:8000
 
-The bundled `server.py` serves the site and proxies real-time prices from
-Yahoo Finance at `/api/quotes`. Prices, day change and the ticker tape then
-update live (polled every 15 s) — a LIVE/DEMO badge on the ticker shows the
-feed status. Fundamentals and financials remain illustrative demo data.
+The bundled `server.py` serves the site and proxies Yahoo Finance. On boot it
+replays whatever it cached last time from **`dalal.db`** (SQLite, auto-created,
+git-ignored), so the page is useful before the first request goes out, and a
+background thread keeps refreshing quotes and history so a page load never waits
+on Yahoo. The badge on the ticker shows what you are looking at:
 
-Option 2 — just open the file (demo data only):
+| Badge | Meaning |
+|---|---|
+| **LIVE** | `server.py` reached Yahoo Finance on its last pass |
+| **CACHED** | real Yahoo numbers, served from the local cache / `js/snapshot.js` |
+| **DEMO** | generated dataset — no Yahoo data available |
 
-    double-click index.html  (or: xdg-open index.html)
+Option 2 — GitHub Pages or double-clicked `index.html` (no server):
 
-No build step, no dependencies, works offline.
+    python3 server.py --snapshot --history   # refresh js/snapshot.js
+    git add js/snapshot.js && git commit -m "data: refresh snapshot"
+
+`js/snapshot.js` is committed generated data: the latest real quotes plus ~5
+years of month-end closes for the featured names. The site loads it and shows
+real prices and real charts, with the badge reading CACHED and the age of the
+data in the tooltip. GitHub Actions regenerates it for you — see
+`.github/workflows/snapshot.yml`, which runs the fetcher every two hours and
+pushes the new file.
+
+    python3 server.py --snapshot             # quotes + cached history
+    python3 server.py --snapshot --history   # also refetch all 5y history
+
+## Data pipeline
+
+| Endpoint / file | What it does |
+|---|---|
+| `GET /api/quotes?s=…` | Quotes for the featured tier (or any symbols you ask for), served straight from `dalal.db` |
+| `GET /api/history?s=TCS,SENSEX` | ~5y of month-end closes per symbol from the cache — the chart on a detail page uses this, so it needs no Yahoo round-trip |
+| `GET /api/snapshot` | The same payload that is written to `js/snapshot.js` |
+| `GET /api/universe` | NSE's full listing (cached in SQLite for a day) |
+| `dalal.db` | SQLite cache: `quotes`, `history` and `listing`. A background thread loops every ~12 s — featured quotes each cycle plus three batches of the wide universe; history once a day |
+| `js/snapshot.js` | Generated, committed fallback so static hosting still shows real data |
+
+Yahoo rate-limits unauthenticated clients hard (HTTP 429), which is why the
+server keeps its own clock, a shared cooldown across all callers, and prefers
+`urllib` over `curl` — see `_http()` in `server.py`.
 
 ## What's inside
 
@@ -36,8 +68,10 @@ No build step, no dependencies, works offline.
 | `js/universe_nse.js` | Generated from NSE's official EQUITY_L.csv — the complete board (2,578 securities), so every listed stock is searchable offline too (`python3 server.py --refresh-universe` regenerates it) |
 | `js/charts.js` | Canvas chart engine: price chart (crosshair, volume, 50/200 DMA, normalized compare), donut, bar chart, sparklines |
 | `js/app.js` | Hash-router SPA: Overview, Stock detail, Screener, Compare, Watchlist |
-| `js/live.js` | Live overlay: polls `/api/quotes` every 15 s, patches prices/day-change into the dataset, rebuilds ticker + current view, LIVE/DEMO badge |
-| `server.py` | Zero-dependency Python server: serves the site + `/api/quotes` and `/api/universe` proxies to Yahoo Finance and NSE's official listing. Tier 1 polls indices + curated stocks per-symbol; tier 2 refreshes all 2,584 symbols in batched calls. Includes retry/backoff, 429 cooldown and caching |
+| `js/live.js` | Live overlay: polls `/api/quotes` every 15 s, pulls real history when you open a symbol, falls back to `js/snapshot.js`, patches prices/day-change into the dataset, LIVE/CACHED/DEMO badge |
+| `js/snapshot.js` | **Generated** — real quotes + 5y history for the featured symbols, written by `server.py --snapshot` |
+| `server.py` | Zero-dependency Python server: serves the site, proxies Yahoo Finance + NSE's listing, caches both in SQLite, refreshes in the background, and emits `js/snapshot.js`. Retry/backoff, shared 429 cooldown, per-tier pacing |
+
 
 ## Features
 
@@ -74,8 +108,20 @@ This re-downloads EQUITY_L.csv, updates the cache and regenerates
 `js/universe_nse.js`. Adding a stock by hand is still possible: append
 `["SYMBOL", "Company Name", "Sector"],` to `UNIVERSE_META` in `js/data.js`.
 
-## Plugging in live data
+## Swapping the data source
 
-`server.py` already proxies live quotes into the dataset at runtime (see
-`js/live.js`). To point at another source, keep the `close` (array of numbers)
-+ `stats` shape and the rest of the app works unchanged.
+`js/live.js` overlays real data onto the generated dataset in this order:
+
+1. `/api/quotes` from `server.py` (queried every 15 s) — replaces price, day
+   change and previous close for every symbol the server knows.
+2. `/api/history?s=SYMBOL` — when you open a symbol, its real month-end closes
+   replace the generated path (log-linear interpolation onto the daily grid, so
+   1M/1Y/5Y ranges and the MAs stay coherent).
+3. `js/snapshot.js` — the same two things, baked at build time, when no server
+   is reachable (GitHub Pages, `file://`).
+4. The generated dataset, last resort, labelled DEMO.
+
+To use a different provider, keep the shape the server already returns —
+`{"quotes": {"SYM": {"price", "prevClose", "changePct", "time"}}}` and
+`{"history": {"SYM": [["2026-09-25", 123.4], ...]}}` — and everything else in
+the app works unchanged.

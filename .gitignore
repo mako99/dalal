@@ -13,3 +13,9 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# Runtime cache (SQLite) — rebuilt by server.py, never committed
+dalal.db
+dalal.db-journal
+dalal.db-wal
+dalal.db-shm
