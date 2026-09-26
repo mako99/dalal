@@ -1,734 +1,458 @@
 #!/usr/bin/env python3
+"""Dalal — static site + market-data API.
+
+This file is deliberately thin: everything about *where* data comes from,
+*how* it is validated and *how* it is cached lives in the `marketdata`
+package. Here we only serve it over HTTP and run the refresh loop.
+
+Endpoints
+    GET /api/market                 dashboard payload (indices, quotes, breadth, movers)
+    GET /api/market?history=1       … including 5y daily history for the featured set
+    GET /api/quotes?s=TCS,INFY      validated quotes for those symbols (on demand)
+    GET /api/quotes?full=1          every symbol currently cached
+    GET /api/history?s=TCS&range=1Y OHLC candles + closes (1D…5Y)
+    GET /api/fundamentals?s=TCS     provider-reported metrics, or available:false
+    GET /api/search?q=tata          ranked symbol search
+    GET /api/universe               the symbols the site can show
+    GET /api/calendar               sessions + NSE holidays, with market state
+    GET /api/meta                   provenance: providers, timestamps, cache
+    GET /api/health                 liveness + counters (safe to poll)
+
+CLI
+    python3 server.py                        serve on PORT (default 8000)
+    python3 server.py --snapshot             refresh once, write js/snapshot.js, exit
+    python3 server.py --snapshot --history   … with 5y history for featured symbols
+    python3 server.py --check                print provider/market diagnostics, exit
+    python3 server.py --refresh-universe     regenerate js/universe_nse.js from NSE
+    python3 server.py --no-fetch             serve without any outbound calls
+
+Environment: see marketdata/config.py (MARKET_PROVIDER, MARKET_REFRESH_INTERVAL,
+DAILY_MARKET_SYNC, TIMEZONE, PORT, MARKET_OFFLINE, …). There are no API keys in
+this application, and nothing provider-side is ever exposed to the browser.
 """
-Dalal live-data server.
+from __future__ import annotations
 
-Serves the static site and proxies live quotes from Yahoo Finance at
-  GET /api/quotes                -> indices + curated stocks (small default)
-  GET /api/quotes?s=TCS,INFY     -> those symbols (fetched live on demand)
-  GET /api/quotes?full=1         -> every symbol cached so far
-  GET /api/history?s=TCS,SENSEX  -> month-end closes for the last 5 years
-  GET /api/snapshot              -> quotes + history for the featured symbols
-  GET /api/universe              -> the complete NSE equity listing
-
-Quotes are kept in SQLite (dalal.db) so a restart starts warm, and the
-featured symbols are also written out to js/snapshot.js so the site shows
-real numbers when it is hosted without this server (GitHub Pages).
-
-Run:      python3 server.py           (then open http://localhost:8000)
-Snapshot: python3 server.py --snapshot [--history]
-Universe: python3 server.py --refresh-universe
-"""
+import argparse
 import csv
+import gzip
 import io
 import json
+import logging
+import os
 import re
-import shutil
-import sqlite3
-import subprocess
+import signal
+import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
-ROOT = Path(__file__).parent
-PORT = 8000
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Local cache of the last known good data. Quotes live in SQLite so the site
-# already shows recent numbers the moment it boots (and while Yahoo is away),
-# and the featured symbols also get a committed js/snapshot.js for GitHub
-# Pages / file:// where no server is running at all.
-DB_PATH = ROOT / "dalal.db"
-SNAPSHOT_FILE = ROOT / "js" / "snapshot.js"
-SNAPSHOT_EVERY = 1800        # rewrite js/snapshot.js at most every 30 min
-HIST_MONTHS = 60             # five years of monthly closes in the snapshot
-HIST_TTL = 86400             # refetch a symbol's history once a day
-QUOTES_TTL = 25              # seconds a cached quote may serve a direct ask
+from marketdata import calendar as mcal            # noqa: E402
+from marketdata import config, service, symbols    # noqa: E402
 
-# Indices need explicit Yahoo tickers; every stock symbol maps to <SYM>.NS.
-INDEX_MAP = {
-    "NIFTY 50": "^NSEI",
-    "SENSEX": "^BSESN",
-    "BANKNIFTY": "^NSEBANK",
-    "NIFTY IT": "^CNXIT",
-}
+ROOT = config.ROOT
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+                    datefmt="%H:%M:%S")
+log = logging.getLogger("dalal.server")
 
-def _discover_symbols():
-    """Read js/data.js so the server tracks exactly what the site ships:
-    the curated 'sym: "X"' records plus the UNIVERSE_META symbol table.
-    Index names (SENSEX, BANKNIFTY, ...) are excluded — they carry their own
-    Yahoo tickers in INDEX_MAP and must not be mapped as <SYM>.NS."""
-    try:
-        src = (ROOT / "js" / "data.js").read_text(encoding="utf-8")
-    except OSError:
-        return [], []
-    idx = set(INDEX_MAP)
-    curated = sorted(set(re.findall(r'sym:\s*"([A-Z0-9&\-]+)"', src)) - idx)
-    block = ""
-    start = src.find("const UNIVERSE_META")
-    if start != -1:
-        end = src.find("\n  ];", start)
-        block = src[start:end if end != -1 else len(src)]
-    universe = sorted(set(re.findall(r'\["([A-Z0-9&\-]+)",\s*"', block)) - idx)
-    return curated, universe
+SVC = service.MarketService()
+_STOP = threading.Event()
+_last_snapshot = 0.0
 
 
-CURATED_SYMS, UNIVERSE_SYMS = _discover_symbols()
-STOCK_SYMS = sorted(set(CURATED_SYMS) | set(UNIVERSE_SYMS))
-YAHOO = {s: s + ".NS" for s in STOCK_SYMS}
-YAHOO.update(INDEX_MAP)  # indices always keep their ^-prefixed tickers
+# --------------------------------------------------------------- snapshot --
+def write_snapshot(include_history: bool = True) -> Path:
+    """Write js/snapshot.js atomically so a reader never sees a half file."""
+    global _last_snapshot
+    tmp = config.SNAPSHOT_FILE.with_suffix(".js.tmp")
+    tmp.write_text(SVC.snapshot_js(include_history=include_history), encoding="utf-8")
+    tmp.replace(config.SNAPSHOT_FILE)
+    _last_snapshot = time.time()
+    log.info("snapshot written: %s (%.1f KB)", config.SNAPSHOT_FILE.name,
+             config.SNAPSHOT_FILE.stat().st_size / 1024)
+    return config.SNAPSHOT_FILE
 
-# ---- complete NSE listing (official EQUITY_L.csv) -------------------------
-NSE_CSV_URLS = [
-    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
-    "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
-]
-UNIVERSE_FILE = ROOT / "universe_nse.json"
-UNIVERSE_TTL = 7 * 86400  # refresh the list weekly
 
-
-def load_nse_universe(force=False):
-    """Complete NSE equity list as [{sym, name, series}]. Cached on disk."""
-    if not force and UNIVERSE_FILE.exists():
+def _maybe_snapshot(force: bool = False) -> None:
+    if force or (time.time() - _last_snapshot) > config.SNAPSHOT_EVERY:
         try:
-            cached = json.loads(UNIVERSE_FILE.read_text(encoding="utf-8"))
-            if cached.get("symbols") and (time.time() - cached.get("fetched", 0)) < UNIVERSE_TTL:
-                return cached["symbols"]
-        except Exception:
-            pass
-    for url in NSE_CSV_URLS:
+            write_snapshot(include_history=True)
+        except Exception as exc:              # noqa: BLE001 - never kill the loop
+            log.warning("snapshot failed: %s", exc)
+
+
+# ------------------------------------------------------------ refresh loop --
+def _interval() -> int:
+    return config.MARKET_REFRESH_INTERVAL if mcal.market_state()["isOpen"] \
+        else config.CLOSED_REFRESH_INTERVAL
+
+
+def _daily_sync_due() -> bool:
+    """True once per trading day, in a short window after the configured close."""
+    import datetime as dt
+    now = mcal.now_ist()
+    if SVC.last_daily_sync >= mcal.market_state()["tradeDate"]:
+        return False
+    try:
+        hh, mm = (int(x) for x in config.DAILY_MARKET_SYNC.split(":"))
+    except (ValueError, AttributeError):
+        hh, mm = 15, 45
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    slack = target + dt.timedelta(minutes=config.DAILY_SYNC_SLACK_MIN)
+    if not mcal.is_trading_day(now.date()):
+        return False
+    return target <= now <= slack
+
+
+def _mark_daily_sync() -> None:
+    SVC.last_daily_sync = mcal.now_ist().date().isoformat()
+    SVC.store.set_meta("last_daily_sync", SVC.last_daily_sync)
+
+
+def refresher() -> None:
+    """Background loop: refresh the tiers on a market-aware schedule."""
+    log.info("refresher idle %.0fs; waiting %ss while closed, %ss while open",
+             time.time(), config.CLOSED_REFRESH_INTERVAL, config.MARKET_REFRESH_INTERVAL)
+    time.sleep(1.0)
+    while not _STOP.is_set():
         try:
-            raw = _http(url).decode("utf-8-sig", errors="replace")
-            out = []
-            for row in csv.DictReader(io.StringIO(raw)):
-                sym = (row.get("SYMBOL") or "").strip().upper()
-                if not sym or not re.fullmatch(r"[A-Z0-9&\-]+", sym):
-                    continue
-                out.append({
-                    "sym": sym,
-                    "name": (row.get("NAME OF COMPANY") or sym).strip() or sym,
-                    "series": (row.get(" SERIES") or row.get("SERIES") or "EQ").strip(),
-                })
-            if out:
-                UNIVERSE_FILE.write_text(
-                    json.dumps({"fetched": time.time(), "source": url, "symbols": out}),
-                    encoding="utf-8")
-                return out
-        except Exception:
+            result = SVC.refresh(wide=True)
+            if result.get("errors"):
+                log.info("cycle kept %d values (%s)", result["refreshed"],
+                         "; ".join(result["errors"])[:160])
+        except Exception as exc:              # noqa: BLE001
+            log.warning("refresh cycle failed: %s", exc)
+        if config.OFFLINE:
+            log.info("MARKET_OFFLINE=1 - serving cache only, refresher idles")
+            _STOP.wait(3600)
             continue
-    return []
-
-
-NSE_LIST = []   # populated below, after _http() is defined
-NSE_SYMS = []
-ALL_SYMS = STOCK_SYMS
-
-# fast tier: indices + hand-curated stocks (accurate per-symbol changePct)
-FAST_SYMS = list(INDEX_MAP) + CURATED_SYMS
-# wide tier: the whole listing, fetched in batches via the spark endpoint
-SPARK_CHUNK = 80
-SPARK_PER_CYCLE = 3   # batches per refresh cycle
-SPARK_GAP = 0.5       # seconds between batched calls
-
-_cache = {"ts": 0.0, "data": {}, "last_fresh": 0}
-HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
-_last_attempt = 0.0
-_cooldown_until = 0.0
-MIN_GAP = 1.2  # seconds between outbound calls to stay under Yahoo's rate limits
-COOLDOWN = 300  # pause outbound calls for 5 min after a 429
-
-
-class RateLimited(Exception):
-    """Yahoo edge responded 429 — back off globally."""
-
-
-# ---- SQLite cache ----------------------------------------------------------
-_db_conn = None
-_db_lock = threading.Lock()
-
-
-def _db():
-    """One shared connection: the refresher thread and the HTTP handler
-    threads both use it, so every access is serialised by _db_lock."""
-    global _db_conn
-    if _db_conn is None:
-        _db_conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        _db_conn.execute(
-            "CREATE TABLE IF NOT EXISTS quotes("
-            "sym TEXT PRIMARY KEY, price REAL, prev_close REAL,"
-            "change_pct REAL, ts REAL)")
-        _db_conn.execute(
-            "CREATE TABLE IF NOT EXISTS history("
-            "sym TEXT PRIMARY KEY, json TEXT, fetched REAL)")
-        _db_conn.commit()
-    return _db_conn
-
-
-def db_save_quotes(quotes):
-    """Persist the last known quote per symbol (survives restarts)."""
-    rows = [(s, q.get("price"), q.get("prevClose"), q.get("changePct"),
-             q.get("time") or time.time())
-            for s, q in quotes.items()
-            if isinstance(q.get("price"), (int, float))]
-    if not rows:
-        return 0
-    try:
-        with _db_lock:
-            db = _db()
-            db.executemany(
-                "INSERT OR REPLACE INTO quotes"
-                "(sym, price, prev_close, change_pct, ts) VALUES(?,?,?,?,?)", rows)
-            db.commit()
-    except sqlite3.Error:
-        return 0
-    return len(rows)
-
-
-def db_load_quotes(max_age=None):
-    """{sym: quote} for everything cached on disk, newest first per symbol."""
-    sql = ("SELECT q.sym, q.price, q.prev_close, q.change_pct, q.ts "
-           "FROM quotes q JOIN (SELECT sym, MAX(ts) m FROM quotes GROUP BY sym) x"
-           " ON q.sym = x.sym AND q.ts = x.m")
-    try:
-        with _db_lock:
-            rows = _db().execute(sql).fetchall()
-    except sqlite3.Error:
-        return {}
-    out = {}
-    for sym, price, prev, pct, ts in rows:
-        if price is None:
-            continue
-        if max_age is not None and (time.time() - (ts or 0)) > max_age:
-            continue
-        out[sym] = {"price": price, "prevClose": prev,
-                    "changePct": pct, "time": ts}
-    return out
-
-
-def db_save_history(sym, points):
-    try:
-        with _db_lock:
-            _db().execute("INSERT OR REPLACE INTO history(sym, json, fetched) VALUES(?,?,?)",
-                          (sym, json.dumps(points), time.time()))
-            _db().commit()
-    except sqlite3.Error:
-        pass
-
-
-def db_load_history(syms, max_age=None):
-    """{sym: [[date, close], ...]} for symbols already fetched before.
-    `max_age` (seconds) skips rows older than that so callers can trigger a
-    refresh without clearing the table."""
-    want = [s for s in syms if s in YAHOO]
-    if not want:
-        return {}
-    out = {}
-    try:
-        with _db_lock:
-            db = _db()
-            for sym in want:
-                row = db.execute("SELECT json, fetched FROM history WHERE sym=?", (sym,)).fetchone()
-                if not row:
-                    continue
-                if max_age is not None and (time.time() - (row[1] or 0)) > max_age:
-                    continue
-                pts = json.loads(row[0])
-                if pts:
-                    out[sym] = pts
-    except (sqlite3.Error, ValueError):
-        return out
-    return out
-
-
-def _rate_wait(gap):
-    """Space outbound calls so we stay under Yahoo's rate limits."""
-    global _last_attempt
-    wait = gap - (time.time() - _last_attempt)
-    if wait > 0:
-        time.sleep(wait)
-    _last_attempt = time.time()
-
-
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-# Yahoo's edge answers this UA with JSON and answers some others with 429,
-# so it is not cosmetic — a Firefox UA string was getting 429 on every call.
-HDRS = {
-    "User-Agent": UA,
-    "Accept": "application/json, text/html, */*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
-
-
-def _http(url):
-    """GET a URL and return the body.
-
-    urllib goes first: Yahoo's edge answers it. curl (HTTP/2, different TLS
-    fingerprint) is only a fallback, because the same request that urllib
-    answers with JSON comes back as 429 from curl.
-    Raises RateLimited on 429/999 responses.
-    """
-    last_err = None
-    try:
-        req = urllib.request.Request(url, headers=HDRS)
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.read()
-    except urllib.error.HTTPError as e:
-        if e.code in (429, 999):
-            raise RateLimited(f"HTTP {e.code}") from e
-        last_err = e
-    except Exception as e:
-        last_err = e
-    if shutil.which("curl"):
-        p = subprocess.run(
-            ["curl", "-sS", "--max-time", "8", "-A", UA,
-             "-H", "Accept: " + HDRS["Accept"],
-             "-H", "Accept-Language: en-US,en;q=0.5",
-             "-w", "\n%{http_code}", url],
-            capture_output=True)
-        out = p.stdout
-        if out:
-            body, _, tail = out.rpartition(b"\n")
-            if tail.strip().isdigit():
-                code = int(tail.strip())
-                if code in (429, 999):
-                    raise RateLimited(f"HTTP {code}")
-                if 200 <= code < 300:
-                    return body
-    raise last_err
-
-
-# ---- initialise the complete NSE listing (needs _http above) --------------
-NSE_LIST = load_nse_universe()
-NSE_SYMS = sorted({e["sym"] for e in NSE_LIST} - set(INDEX_MAP))
-YAHOO.update({s: s + ".NS" for s in NSE_SYMS})
-ALL_SYMS = sorted(set(STOCK_SYMS) | set(NSE_SYMS))
-
-
-def fetch_one(sym):
-    """Fetch a live quote for one Dalal symbol via Yahoo's chart endpoint.
-    Tries query1/query2 with a retry; raises on total failure."""
-    global _last_attempt, _cooldown_until
-    if time.time() < _cooldown_until:
-        raise RateLimited("cooldown active")
-    url_path = (f"/v8/finance/chart/{urllib.parse.quote(YAHOO[sym])}?range=1d&interval=1m")
-    last_err = None
-    for attempt in range(3):
-        host = HOSTS[attempt % len(HOSTS)]
-        _rate_wait(MIN_GAP)
-        try:
-            raw = _http("https://" + host + url_path)
-            payload = json.loads(raw.decode())
-            res = (payload.get("chart") or {}).get("result") or []
-            if not res:
-                raise ValueError("empty chart result")
-            meta = res[0].get("meta", {})
-            price = meta.get("regularMarketPrice")
-            if price is None:
-                raise ValueError("no price in meta")
-            return {
-                "price": price,
-                "prevClose": meta.get("chartPreviousClose") or meta.get("previousClose"),
-                "changePct": meta.get("regularMarketChangePercent"),
-                "time": meta.get("regularMarketTime"),
-            }
-        except RateLimited as e:
-            _cooldown_until = time.time() + COOLDOWN  # stop hammering, back off
-            raise
-        except Exception as e:
-            last_err = e
-            time.sleep(1.5 * (attempt + 1))  # back off on transient errors
-    raise last_err  # propagate so caller can decide
-
-
-def fetch_quotes(syms):
-    """Fetch live quotes per-symbol (accurate changePct). Returns {sym: quote}.
-    Resilient: a single bad symbol is skipped and cached values are kept.
-    Every freshly fetched quote is also written to dalal.db."""
-    out = dict(_cache["data"])
-    fresh = {}
-    try:
-        for sym in syms:
-            if sym not in YAHOO:
-                continue
+        _maybe_snapshot()
+        if _daily_sync_due():
+            log.info("daily post-close sync for %s", mcal.market_state()["tradeDate"])
             try:
-                q = fetch_one(sym)
-            except RateLimited:
-                raise
-            except Exception:
-                continue  # e.g. symbol not listed on Yahoo — skip it
-            out[sym] = q
-            fresh[sym] = q
-    except RateLimited:
-        pass  # throttled — serve whatever we have, retry after cooldown
-    if fresh:
-        _cache["ts"] = time.time()
-        _cache["data"] = out
-        _cache["last_fresh"] = len(fresh)
-        db_save_quotes(fresh)
-    else:
-        _cache["last_fresh"] = 0
-    return out
+                SVC.refresh(wide=True)
+                write_snapshot(include_history=True)
+                _mark_daily_sync()
+            except Exception as exc:          # noqa: BLE001
+                log.warning("daily sync failed: %s", exc)
+        _STOP.wait(max(30, _interval()))
 
 
-def fetch_spark(syms):
-    """Batched quote fetch via Yahoo's spark endpoint — many symbols per call,
-    used for the wide universe so we stay well inside rate limits."""
-    global _cooldown_until
-    want = [s for s in syms if s in YAHOO]
-    if not want:
-        return 0
-    if time.time() < _cooldown_until:
-        raise RateLimited("cooldown active")
-    url = ("https://" + HOSTS[0] + "/v7/finance/spark?symbols="
-           + urllib.parse.quote(",".join(YAHOO[s] for s in want))
-           + "&indicators=close")
-    _rate_wait(SPARK_GAP)
-    try:
-        payload = json.loads(_http(url).decode())
-    except RateLimited:
-        _cooldown_until = time.time() + COOLDOWN
-        raise
-    got = 0
-    fresh = {}
-    for sym in want:
-        entry = payload.get(YAHOO[sym]) or payload.get(sym)
-        if not isinstance(entry, dict):
-            continue
-        closes = entry.get("close") or []
-        price = closes[-1] if closes else None
-        if not isinstance(price, (int, float)):
-            continue
-        prev = entry.get("chartPreviousClose") or entry.get("previousClose")
-        fresh[sym] = {
-            "price": price,
-            "prevClose": prev,
-            "changePct": ((price - prev) / prev * 100) if prev else None,
-            "time": entry.get("regularMarketTime"),
-        }
-        got += 1
-    if got:
-        _cache["data"].update(fresh)
-        _cache["ts"] = time.time()
-        db_save_quotes(fresh)
-    return got
-
-
-# ---- real price history (5y of monthly closes per featured symbol) ---------
-def _monthly(points, months=HIST_MONTHS):
-    """Thin a daily [date, close] list down to roughly the last `months`
-    month-end points (always keeping the newest one)."""
-    if not points:
-        return []
-    by_month = {}
-    for d, c in points:
-        by_month[d[:7]] = [d, c]          # later dates overwrite -> month end
-    vals = [by_month[k] for k in sorted(by_month)]
-    if len(vals) > months:
-        vals = vals[-months:]
-    return vals
-
-
-def fetch_history(sym):
-    """Daily closes for a symbol over the last 5y, thinned to month ends.
-    Returns [[\"2021-09-24\", 63.2], ...] (possibly empty)."""
-    global _cooldown_until
-    if sym not in YAHOO:
-        return []
-    if time.time() < _cooldown_until:
-        raise RateLimited("cooldown active")
-    _rate_wait(MIN_GAP)
-    for attempt, host in enumerate(HOSTS):
-        url = (f"https://{host}/v8/finance/chart/{urllib.parse.quote(YAHOO[sym])}"
-               "?range=5y&interval=1d")
-        try:
-            payload = json.loads(_http(url).decode())
-            res = (payload.get("chart") or {}).get("result") or []
-            if not res:
-                raise ValueError("empty chart result")
-            stamps = res[0].get("timestamp") or []
-            closes = ((res[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
-            pts = []
-            for ts, c in zip(stamps, closes):
-                if not isinstance(c, (int, float)) or c <= 0:
-                    continue
-                pts.append([time.strftime("%Y-%m-%d", time.gmtime(int(ts))), round(c, 2)])
-            if len(pts) < 30:
-                raise ValueError("history too short")
-            return _monthly(pts)
-        except RateLimited:
-            _cooldown_until = time.time() + COOLDOWN
-            raise
-        except Exception:
-            if attempt == len(HOSTS) - 1:
-                return []
-            time.sleep(1.5)
-    return []
-
-
-def refresh_history(force=False):
-    """Make sure every featured symbol has ~5y of monthly closes in the DB.
-    Rows younger than a day are reused, so this is cheap after the first run."""
-    have = {} if force else db_load_history(FAST_SYMS, max_age=HIST_TTL)
-    out = dict(have)
-    for sym in FAST_SYMS:
-        if sym in out:
-            continue
-        try:
-            pts = fetch_history(sym)
-        except RateLimited:
-            break
-        except Exception:
-            pts = []
-        if pts:
-            db_save_history(sym, pts)
-            out[sym] = pts
-    return out
-
-
-def warm_cache():
-    """Start every boot with the freshest data we already have on disk:
-    the site is useful immediately, even before Yahoo answers."""
-    stored = db_load_quotes()
-    if stored:
-        newest = max((q.get("time") or 0) for q in stored.values())
-        _cache["data"].update(stored)
-        _cache["ts"] = min(_cache["ts"] or newest, newest) if _cache["ts"] else newest
-    return len(stored)
-
-
-def refresh_fast():
-    """One pass of the featured tier (indices + curated stocks) plus a
-    committed snapshot when Yahoo answered. Returns the quote count."""
-    fetch_quotes(FAST_SYMS)
-    if _cache["last_fresh"]:
-        maybe_write_snapshot()
-    return len(_cache["data"])
-
-
-_snapshot_state = {"ts": 0.0}
-
-
-def maybe_write_snapshot(force=False):
-    """Rewrite js/snapshot.js at most once per SNAPSHOT_EVERY seconds."""
-    now = time.time()
-    if not force and (now - _snapshot_state["ts"]) < SNAPSHOT_EVERY:
-        return None
-    path = write_snapshot()
-    if path:
-        _snapshot_state["ts"] = now
-    return path
-
-
-def build_snapshot():
-    """The payload committed to js/snapshot.js: live quotes + real 5y
-    month-end closes for the indices and the curated stocks."""
-    quotes = {s: _cache["data"][s] for s in FAST_SYMS if s in _cache["data"]}
-    hist = db_load_history(FAST_SYMS)
-    return {"fetched": round(time.time(), 1), "quotes": quotes, "history": hist}
-
-
-def write_snapshot(payload=None):
-    """Emit js/snapshot.js so GitHub Pages / file:// show real numbers."""
-    data = payload or build_snapshot()
-    if not data.get("quotes") and not data.get("history"):
-        return None
-    js = ("/* Generated by server.py — real Yahoo Finance data.\n"
-          "   Refresh with:  python3 server.py --snapshot\n"
-          "   Quotes are the last values the server saw; history is ~5y of\n"
-          "   month-end closes for the indices and curated stocks. */\n"
-          "window.DALAL_SNAPSHOT = "
-          + json.dumps(data, separators=(",", ":")) + ";\n")
-    SNAPSHOT_FILE.write_text(js, encoding="utf-8")
-    return SNAPSHOT_FILE
-
-
+# --------------------------------------------------------------- HTTP API --
 class Handler(SimpleHTTPRequestHandler):
-    def __init__(self, *a, **kw):
-        super().__init__(*a, directory=str(ROOT), **kw)
+    server_version = "Dalal/2.0"
 
-    def log_message(self, fmt, *args):  # quieter logs
-        pass
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, directory=str(ROOT), **kwargs)
 
-    def do_GET(self):
-        if self.path.startswith("/api/universe"):
-            self._handle_universe()
-        elif self.path.startswith("/api/quotes"):
-            self._handle_quotes()
-        elif self.path.startswith("/api/history"):
-            self._handle_history()
-        elif self.path.startswith("/api/snapshot"):
-            self._json(200, build_snapshot())
-        else:
-            super().do_GET()
+    # -- helpers ------------------------------------------------------------
+    def log_message(self, fmt: str, *args: Any) -> None:      # quieter access log
+        if "/api/" in (self.path or ""):
+            log.debug("%s %s", self.address_string(), fmt % args)
 
-    def end_headers(self):
-        # lets the page work when opened straight from file:// as well
+    def _send_json(self, obj: Any, status: int = 200, max_age: int = 0) -> None:
+        body = json.dumps(obj, separators=(",", ":"), default=str).encode()
+        encoding = ""
+        # The dashboard payload carries every tracked quote, so it is worth
+        # compressing on the wire when the client asks for it.
+        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            body, encoding = gzip.compress(body, 6), "gzip"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store" if max_age == 0
+                         else f"public, max-age={max_age}")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    def _query(self) -> dict[str, list[str]]:
+        return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+    def _symbols_param(self, q: dict[str, list[str]]) -> list[str]:
+        raw: list[str] = []
+        for value in q.get("s", []) + q.get("symbols", []) + q.get("symbol", []):
+            raw += [p for p in value.replace("|", ",").split(",") if p.strip()]
+        return raw
+
+    # -- routing ------------------------------------------------------------
+    def do_OPTIONS(self) -> None:                              # noqa: N802
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self) -> None:                                  # noqa: N802
+        path = urllib.parse.urlparse(self.path).path
+        if not path.startswith("/api/"):
+            return super().do_GET()
+        q = self._query()
+        try:
+            handler = ROUTES.get(path)
+            if handler is None:
+                return self._send_json({"error": "unknown endpoint", "path": path},
+                                       status=404)
+            return handler(self, q)
+        except Exception as exc:                # noqa: BLE001 - never 500 blindly
+            log.exception("api error on %s", path)
+            return self._send_json({"error": str(exc)[:200], "path": path}, status=503)
+
+    # -- static files -------------------------------------------------------
+    def end_headers(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path.endswith((".js", ".css", ".svg", ".png", ".woff2")):
+            self.send_header("Cache-Control", "public, max-age=300")
+        elif path.endswith(".html") or path in ("/", ""):
+            self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
-    def _handle_universe(self):
-        """The complete NSE listing so the front-end can offer every stock."""
-        syms = NSE_LIST or [{"sym": s, "name": s, "series": "EQ"} for s in UNIVERSE_SYMS]
-        self._json(200, {
-            "ok": True,
-            "count": len(syms),
-            "source": "NSE EQUITY_L.csv" if NSE_LIST else "data.js UNIVERSE_META",
-            "symbols": syms,
-        })
 
-    def _handle_quotes(self):
-        """Answer instantly from the background-refreshed cache.
-
-        /api/quotes              -> indices + curated stocks (small default)
-        /api/quotes?s=TCS,INFY   -> just those symbols (fetched live if new)
-        /api/quotes?full=1       -> everything cached so far
-        """
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        req = qs.get("s", [None])[0]
-        full = qs.get("full", ["0"])[0] in ("1", "true", "yes")
-        if req:
-            syms = [s.strip().upper() for s in req.split(",") if s.strip()]
-            missing = [s for s in syms if s not in _cache["data"]][:10]
-            if missing:
-                fetch_quotes(missing)   # first ask for this symbol: go get it
-        elif full:
-            syms = sorted(_cache["data"])
-        else:
-            syms = FAST_SYMS
-        data = {s: _cache["data"][s] for s in syms if s in _cache["data"]}
-        age = round(time.time() - _cache["ts"], 1) if _cache["data"] else None
-        self._json(200, {
-            "ok": True,
-            "quotes": data,
-            "live": bool(_cache["last_fresh"]),
-            "age": age,
-            "count": len(_cache["data"]),
-        })
-
-    def _handle_history(self):
-        """/api/history?s=TCS,SENSEX -> month-end closes for the last 5y.
-        Served from the SQLite cache; only unseen symbols hit the network."""
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        req = qs.get("s", [None])[0]
-        syms = ([s.strip().upper() for s in req.split(",") if s.strip()]
-                if req else FAST_SYMS)
-        hist, age = {}, None
-        for sym in dict.fromkeys(syms):
-            pts = db_load_history([sym])
-            if sym in pts:
-                hist[sym] = pts[sym]
-                continue
-            try:
-                pts = fetch_history(sym)
-            except Exception:
-                pts = []
-            if pts:
-                db_save_history(sym, pts)
-                hist[sym] = pts
-        age = round(time.time() - _cache["ts"], 1) if _cache["data"] else None
-        self._json(200, {"ok": True, "history": hist,
-                         "count": len(hist), "months": HIST_MONTHS, "age": age})
-
-    def _json(self, code, obj):
-        body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+# ------------------------------------------------------------------ routes --
+def api_market(h: Handler, q: dict[str, list[str]]) -> None:
+    with_hist = q.get("history", ["0"])[0] not in ("0", "false", "")
+    h._send_json(SVC.market_payload(include_history=with_hist))
 
 
-def write_client_universe(symbols):
-    """Emit js/universe_nse.js so the full listing works offline too."""
-    pairs = [[e["sym"], e["name"]] for e in symbols]
-    js = ("/* Generated from NSE's official EQUITY_L.csv by:\n"
-          "   python3 server.py --refresh-universe\n"
-          "   Symbols + company names only; fundamentals are illustrative. */\n"
-          "window.DALAL_NSE_UNIVERSE = "
-          + json.dumps(pairs, ensure_ascii=False, separators=(",", ":")) + ";\n")
-    path = ROOT / "js" / "universe_nse.js"
-    path.write_text(js, encoding="utf-8")
-    return path
+def api_quotes(h: Handler, q: dict[str, list[str]]) -> None:
+    if q.get("full", ["0"])[0] not in ("0", "false", ""):
+        live = dict(SVC.quotes)
+        h._send_json({"quotes": live, "count": len(live), "market": SVC.market,
+                      "source": {"line": SVC.chain.source_line()}})
+        return
+    want = h._symbols_param(q) or SVC.featured()
+    h._send_json(SVC.quote_payload(want))
 
 
-def refresher():
-    """Background thread. Tier 1: indices + curated stocks, per-symbol.
-    Tier 2: one batch of the wide universe per cycle, via spark, so the
-    whole list refreshes every few minutes without hammering Yahoo."""
-    try:
-        warm_cache()                 # serve yesterday's numbers until Yahoo talks
-        refresh_history()            # month-end closes for the featured symbols
-    except Exception:
-        pass
-    chunks = [ALL_SYMS[i:i + SPARK_CHUNK] for i in range(0, len(ALL_SYMS), SPARK_CHUNK)]
-    ci = 0
-    spark_fails = 0
-    fallback_rounds = 0
-    slice_size = 12
-    while True:
+def api_history(h: Handler, q: dict[str, list[str]]) -> None:
+    want = h._symbols_param(q)
+    if not want:
+        return h._send_json({"error": "pass ?s=SYMBOL"}, status=400)
+    range_ = (q.get("range", ["1Y"])[0] or "1Y").upper()
+    if len(want) == 1:
+        return h._send_json(SVC.history_payload(want[0], range_))
+    h._send_json({"range": range_, "series": {
+        symbols.canonical(s) or s: SVC.history_payload(s, range_) for s in want[:8]}})
+
+
+def api_fundamentals(h: Handler, q: dict[str, list[str]]) -> None:
+    want = h._symbols_param(q)
+    if not want:
+        return h._send_json({"error": "pass ?s=SYMBOL"}, status=400)
+    if len(want) == 1:
+        return h._send_json(SVC.fundamentals_payload(want[0]))
+    h._send_json({"fundamentals": {symbols.canonical(s) or s:
+                                  SVC.fundamentals_payload(s) for s in want[:10]}})
+
+
+def api_search(h: Handler, q: dict[str, list[str]]) -> None:
+    term = (q.get("q", [""])[0] or "").strip()
+    limit = int((q.get("limit", ["12"])[0]) or 12)
+    results = symbols.search(term, limit=min(40, max(1, limit)))
+    quotes = SVC.quote_payload([r["symbol"] for r in results])["quotes"] if results else {}
+    for r in results:
+        quote = quotes.get(r["symbol"]) or {}
+        r["price"] = quote.get("price")
+        r["changePct"] = quote.get("changePct")
+        r["freshness"] = quote.get("freshness")
+    h._send_json({"query": term, "results": results, "market": SVC.market})
+
+
+def api_universe(h: Handler, q: dict[str, list[str]]) -> None:
+    universe = symbols.load_universe()
+    h._send_json({"count": len(universe),
+                  "symbols": [{"symbol": s, "name": v.get("name") or s,
+                               "sector": v.get("sector") or ""}
+                              for s, v in sorted(universe.items())],
+                  "indices": [{"symbol": k, "name": v["name"], "exchange": v["exchange"]}
+                              for k, v in symbols.INDICES.items()]})
+
+
+def api_calendar(h: Handler, q: dict[str, list[str]]) -> None:
+    days = int((q.get("days", ["400"])[0]) or 400)
+    h._send_json(mcal.calendar_payload(days=min(400, max(7, days))), max_age=300)
+
+
+def api_snapshot(h: Handler, q: dict[str, list[str]]) -> None:
+    with_hist = q.get("history", ["1"])[0] not in ("0", "false", "")
+    h._send_json(SVC.market_payload(include_history=with_hist))
+
+
+def api_meta(h: Handler, q: dict[str, list[str]]) -> None:
+    h._send_json({
+        "source": {"providers": SVC.chain.providers_used(),
+                   "line": SVC.chain.source_line(),
+                   "exchangeStatus": SVC.status},
+        "market": SVC.market,
+        "asOf": SVC.market_payload()["asOf"],
+        "generatedAt": time.time(),
+        "provenance": {"indices": "provider", "quotes": "provider",
+                       "breadth": "derived from real quotes",
+                       "movers": "derived from real quotes", "history": "provider",
+                       "fundamentals": "provider-reported only; otherwise N/A"},
+        "cache": SVC.store.stats(),
+        "config": {"refreshInterval": config.MARKET_REFRESH_INTERVAL,
+                   "closedRefreshInterval": config.CLOSED_REFRESH_INTERVAL,
+                   "dailySync": config.DAILY_MARKET_SYNC,
+                   "timezone": config.TIMEZONE,
+                   "providerOrder": config.PROVIDER_ORDER}})
+
+
+def api_health(h: Handler, q: dict[str, list[str]]) -> None:
+    h._send_json(SVC.health_payload())
+
+
+ROUTES = {
+    "/api/market": api_market,
+    "/api/quotes": api_quotes,
+    "/api/history": api_history,
+    "/api/chart": api_history,
+    "/api/fundamentals": api_fundamentals,
+    "/api/search": api_search,
+    "/api/universe": api_universe,
+    "/api/calendar": api_calendar,
+    "/api/snapshot": api_snapshot,
+    "/api/meta": api_meta,
+    "/api/health": api_health,
+}
+
+
+# --------------------------------------------------------------------- CLI --
+def refresh_universe() -> int:
+    """Regenerate js/universe_nse.js from NSE's official EQUITY_L.csv."""
+    from marketdata.providers import ProviderError, http_get
+    urls = ["https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+            "https://archives.nseindia.com/content/equities/EQUITY_L.csv"]
+    rows: list[tuple[str, str]] = []
+    for url in urls:
         try:
-            refresh_fast()
-        except Exception:
-            pass
-        if spark_fails < 3:
-            for _ in range(SPARK_PER_CYCLE):
-                if not chunks:
-                    break
-                try:
-                    got = fetch_spark(chunks[ci % len(chunks)])
-                    ci += 1
-                    spark_fails = 0 if got else spark_fails + 1
-                except RateLimited:
-                    break  # cooling down; try again next cycle
-                except Exception:
-                    spark_fails += 1
+            raw = http_get(url).decode("utf-8-sig", errors="replace")
+        except ProviderError as exc:
+            log.warning("universe fetch failed (%s): %s", url, exc)
+            continue
+        for row in csv.DictReader(io.StringIO(raw)):
+            sym = (row.get("SYMBOL") or "").strip().upper()
+            name = (row.get("NAME OF COMPANY") or sym).strip()
+            if sym and re.fullmatch(r"[A-Z0-9&\-]{1,24}", sym):
+                rows.append((sym, name))
+        if rows:
+            break
+    if not rows:
+        log.error("could not refresh the universe from NSE")
+        return 1
+    rows = sorted(set(rows))
+    out = ("/* Generated from NSE's official EQUITY_L.csv by:\n"
+           "   python3 server.py --refresh-universe\n"
+           "   Symbols + company names only; prices and fundamentals come from\n"
+           "   the market-data API (see README), never from this file. */\n"
+           "window.DALAL_NSE_UNIVERSE = "
+           + json.dumps(rows, separators=(",", ":")) + ";\n")
+    (ROOT / "js" / "universe_nse.js").write_text(out, encoding="utf-8")
+    log.info("js/universe_nse.js refreshed with %d symbols", len(rows))
+    return 0
+
+
+def diagnostics() -> int:
+    """Print what the pipeline can actually see right now."""
+    print(f"timezone            {config.TIMEZONE}")
+    print(f"provider order      {config.PROVIDER_ORDER}")
+    print(f"refresh interval    {config.MARKET_REFRESH_INTERVAL}s open / "
+          f"{config.CLOSED_REFRESH_INTERVAL}s closed")
+    print(f"daily sync          {config.DAILY_MARKET_SYNC} IST")
+    print(f"universe            {len(symbols.load_universe())} symbols "
+          f"({len(symbols.curated())} curated)")
+    state = mcal.market_state()
+    print(f"market              {state['state']} ({state['label']}) "
+          f"trade date {state['tradeDate']} next open {state['nextOpenLabel']}")
+    print(f"holidays            {len(mcal.holidays())} (source: {mcal._cache['source']})")
+    print(f"cache               {SVC.store.stats()}")
+    if config.OFFLINE:
+        print("offline             yes (MARKET_OFFLINE=1) - no provider calls")
+        return 0
+    result = SVC.refresh(wide=False)
+    print(f"refresh             {result['refreshed']} values in {result['seconds']}s"
+          f"{' errors: ' + '; '.join(result['errors']) if result['errors'] else ''}")
+    payload = SVC.market_payload()
+    for sym in ("NIFTY 50", "SENSEX", "BANKNIFTY", "NIFTY IT"):
+        q = payload["indices"].get(sym) or {}
+        if q.get("price"):
+            print(f"  {sym:11s} {q['price']:>12,.2f}  {q['changePct']:+.2f}%  "
+                  f"{q['source']:6s} {q['freshness']}")
         else:
-            # batched endpoint refused — walk the listing a slice at a time
-            start = (ci * slice_size) % max(1, len(ALL_SYMS))
-            try:
-                fetch_quotes(ALL_SYMS[start:start + slice_size])
-            except Exception:
-                pass
-            ci += 1
-            fallback_rounds += 1
-            if fallback_rounds >= 10:  # periodically retry the batched endpoint
-                spark_fails = 0
-                fallback_rounds = 0
-        time.sleep(12)
+            print(f"  {sym:11s} unavailable ({q.get('reason', '')})")
+    print(f"quotes tracked      {len(payload['quotes'])}")
+    print(f"breadth             {payload['breadth']}")
+    print(f"source              {payload['source']['line']}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Dalal market-data server")
+    ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=config.PORT)
+    ap.add_argument("--snapshot", action="store_true",
+                    help="refresh once, write js/snapshot.js, exit")
+    ap.add_argument("--history", action="store_true",
+                    help="include 5y history in the snapshot")
+    ap.add_argument("--check", action="store_true", help="print diagnostics and exit")
+    ap.add_argument("--refresh-universe", action="store_true",
+                    help="regenerate js/universe_nse.js from NSE")
+    ap.add_argument("--no-fetch", action="store_true",
+                    help="serve from cache only, never call a provider")
+    args = ap.parse_args(argv)
+
+    if args.no_fetch:
+        config.OFFLINE = True
+    if args.refresh_universe:
+        return refresh_universe()
+    if args.check:
+        return diagnostics()
+    if args.snapshot:
+        result = SVC.refresh(wide=False)
+        log.info("pre-snapshot refresh: %s values", result["refreshed"])
+        path = write_snapshot(include_history=args.history)
+        payload = SVC.market_payload()
+        with_hist = len(payload.get("history") or {})
+        print(f"wrote {path} ({path.stat().st_size / 1024:.1f} KB) · "
+              f"{len(payload['indices'])} indices · {len(payload['quotes'])} quotes · "
+              f"{with_hist} history series · source: {payload['source']['line']}")
+        return 0
+
+    if not config.OFFLINE:
+        threading.Thread(target=refresher, name="refresh", daemon=True).start()
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd.daemon_threads = True
+
+    def stop(signum: int, frame: Any) -> None:      # noqa: ARG001
+        log.info("shutting down")
+        _STOP.set()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    log.info("serving %s on http://%s:%d", ROOT, args.host, args.port)
+    log.info("market: %s · sources: %s", mcal.market_state()["label"],
+             SVC.chain.source_line())
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _STOP.set()
+        httpd.server_close()
+    return 0
 
 
 if __name__ == "__main__":
-    import sys
-
-    if "--refresh-universe" in sys.argv:
-        fresh = load_nse_universe(force=True)
-        if fresh:
-            p = write_client_universe(fresh)
-            print(f"Refreshed NSE universe: {len(fresh)} symbols -> {p} and {UNIVERSE_FILE}")
-        else:
-            print("Could not download the NSE list (network blocked?) — keeping existing files.")
-        sys.exit(0)
-
-    if "--snapshot" in sys.argv:
-        n = warm_cache()
-        fetch_quotes(FAST_SYMS)                      # best effort live quotes
-        hist = refresh_history(force="--history" in sys.argv)
-        p = write_snapshot()
-        if p:
-            print(f"Wrote {p}: {len(_cache['data'])} quotes ({n} restored from cache), "
-                  f"history for {len(hist)} symbols")
-        else:
-            print("No data from Yahoo Finance — js/snapshot.js left untouched.")
-        sys.exit(0)
-
-    warm_cache()
-    threading.Thread(target=refresher, daemon=True).start()
-    print(f"Dalal server  →  http://localhost:{PORT}")
-    print(f"  live quotes : {len(ALL_SYMS)} NSE symbols tracked (Yahoo Finance)")
-    print("  history     : /api/history?s=TCS,SENSEX  ·  /api/snapshot")
-    print(f"  listing     : {len(NSE_LIST)} symbols from NSE EQUITY_L.csv")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    sys.exit(main())

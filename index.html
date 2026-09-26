@@ -2,85 +2,182 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Dalal — Stock Analysis for the Indian Market</title>
-<meta name="description" content="Analyse Indian stocks beautifully. Five years of performance, deep fundamentals, screener, side-by-side compare and more."/>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%231d1d1f'/><path d='M24 66 L44 46 L57 56 L78 30' stroke='%2330d158' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>Dalal — Indian Market Dashboard</title>
+<meta name="description" content="Live NIFTY 50, Sensex and Bank Nifty levels, every NSE stock, charts, screener and watchlists — with the timestamp and source of every number shown."/>
+<meta name="color-scheme" content="dark light"/>
+<meta name="theme-color" content="#0b0d12"/>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%230b0d12'/><path d='M24 66 L44 46 L57 56 L78 30' stroke='%2322c55e' stroke-width='9' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>"/>
 <link rel="stylesheet" href="css/styles.css"/>
 </head>
 <body>
+<a class="skip-link" href="#main">Skip to content</a>
 
-<nav class="nav">
-  <div class="nav-inner">
-    <a class="nav-logo" href="#/" aria-label="Dalal home">
-      <svg width="20" height="20" viewBox="0 0 100 100" fill="none">
-        <rect width="100" height="100" rx="24" fill="currentColor"/>
-        <path d="M24 66 L44 46 L57 56 L78 30" stroke="#30d158" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      <span>Dalal</span>
+<header class="topbar" id="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#/" aria-label="Dalal — market dashboard">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 100 100" fill="none">
+          <rect width="100" height="100" rx="24" fill="currentColor"/>
+          <path d="M24 66 L44 46 L57 56 L78 30" stroke="#22c55e" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <span class="brand-name">Dalal</span>
     </a>
-    <div class="nav-links">
-      <a href="#/" data-nav="overview">Overview</a>
-      <a href="#/screener" data-nav="screener">Screener</a>
-      <a href="#/compare" data-nav="compare">Compare</a>
-      <a href="#/watchlist" data-nav="watchlist">Watchlist</a>
-    </div>
-    <div class="search-wrap">
-      <svg class="search-ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-      <input id="navSearch" type="text" placeholder="Search stocks" autocomplete="off" spellcheck="false"/>
-      <div class="search-panel" id="navSearchPanel"></div>
+
+    <nav class="nav" aria-label="Primary">
+      <a href="#/" data-route="dashboard">Overview</a>
+      <a href="#/markets" data-route="markets">Markets</a>
+      <a href="#/screener" data-route="screener">Screener</a>
+      <a href="#/compare" data-route="compare">Compare</a>
+      <a href="#/watchlist" data-route="watchlist">Watchlist</a>
+      <a href="#/calendar" data-route="calendar">Calendar</a>
+    </nav>
+
+    <div class="topbar-actions">
+      <button class="icon-btn search-btn" id="paletteBtn" type="button"
+              aria-haspopup="dialog" aria-keyshortcuts="Control+K /"
+              title="Search stocks (press /)">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+        <span class="search-btn-text">Search</span>
+        <kbd class="kbd">/</kbd>
+      </button>
+      <button class="icon-btn" id="refreshBtn" type="button" title="Refresh market data" aria-label="Refresh market data">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>
+      </button>
+      <button class="icon-btn" id="themeBtn" type="button" title="Switch theme" aria-label="Switch colour theme">
+        <svg class="ic-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg>
+        <svg class="ic-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg>
+      </button>
+      <button class="icon-btn menu-btn" id="menuBtn" type="button" aria-expanded="false" aria-controls="moreMenu" title="More" aria-label="More pages">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+      </button>
     </div>
   </div>
+
+  <div class="more-menu" id="moreMenu" hidden>
+    <a href="#/calendar" data-route="calendar">Market calendar</a>
+    <a href="#/compare" data-route="compare">Compare stocks</a>
+    <a href="#/settings" data-route="settings">Settings</a>
+  </div>
+
+  <div class="statusbar" id="statusbar" role="status" aria-live="polite"></div>
+</header>
+
+<main id="main" class="app-main" tabindex="-1"></main>
+
+<nav class="tabbar" aria-label="Sections">
+  <a href="#/" data-route="dashboard">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+    <span>Overview</span>
+  </a>
+  <a href="#/markets" data-route="markets">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M3 17l5-6 4 3 5-7 4 4"/><path d="M3 21h18"/></svg>
+    <span>Markets</span>
+  </a>
+  <a href="#/screener" data-route="screener">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M3 5h18M6 12h12M10 19h4"/></svg>
+    <span>Screener</span>
+  </a>
+  <a href="#/watchlist" data-route="watchlist">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><path d="M12 4l2.5 5.2 5.5.7-4 3.9 1 5.6-5-2.8-5 2.8 1-5.6-4-3.9 5.5-.7z"/></svg>
+    <span>Watchlist</span>
+  </a>
+  <a href="#/settings" data-route="settings">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5l1.4 2.6 2.9-.5 1 2.8 2.8 1-.5 2.9 2.6 1.4-2.6 1.4.5 2.9-2.8 1-1 2.8-2.9-.5L12 21.5l-1.4-2.6-2.9.5-1-2.8-2.8-1 .5-2.9L1.8 12l2.6-1.4-.5-2.9 2.8-1 1-2.8 2.9.5z"/></svg>
+    <span>Settings</span>
+  </a>
 </nav>
 
-<div class="ticker" id="ticker" aria-hidden="true"></div>
-
-<main id="app"></main>
-
-<footer class="footer">
-  <div class="container">
-    <div class="footer-grid">
-      <div class="footer-brand">
-        <div class="footer-logo">
-          <svg width="26" height="26" viewBox="0 0 100 100" fill="none">
-            <rect width="100" height="100" rx="24" fill="#1d1d1f"/>
-            <path d="M24 66 L44 46 L57 56 L78 30" stroke="#30d158" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          <span>Dalal</span>
-        </div>
-        <p>Stock analysis, reimagined.<br/>Built for the Indian market.</p>
-      </div>
-      <div class="footer-col">
-        <h4>Explore</h4>
-        <a href="#/">Market Overview</a>
-        <a href="#/screener">Stock Screener</a>
-        <a href="#/compare">Compare Stocks</a>
-        <a href="#/watchlist">My Watchlist</a>
-      </div>
-      <div class="footer-col">
-        <h4>Markets</h4>
-        <a href="https://www.nseindia.com" target="_blank" rel="noopener">NSE India</a>
-        <a href="https://www.bseindia.com" target="_blank" rel="noopener">BSE India</a>
-        <a href="https://www.sebi.gov.in" target="_blank" rel="noopener">SEBI</a>
-        <a href="https://www.rbi.org.in" target="_blank" rel="noopener">RBI</a>
-      </div>
-      <div class="footer-col">
-        <h4>Good to know</h4>
-        <p class="footer-note">Prices update in real time via the bundled <b>server.py</b> (Yahoo Finance proxy) when served with it. Fundamentals & financials remain illustrative demo data.</p>
-      </div>
+<div class="palette-backdrop" id="paletteBackdrop" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Search stocks and pages" id="palette">
+    <div class="palette-input">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+      <input id="paletteInput" type="text" role="combobox" aria-expanded="true"
+             aria-controls="paletteList" aria-autocomplete="list" autocomplete="off"
+             spellcheck="false" placeholder="Search any NSE symbol or company…"/>
+      <kbd class="kbd">Esc</kbd>
     </div>
-    <div class="footer-bottom">
-      <span>© 2026 Dalal. Designed in India.</span>
-      <span>Nothing here is investment advice. Please consult a SEBI-registered advisor.</span>
+    <ul class="palette-list" id="paletteList" role="listbox" aria-label="Results"></ul>
+    <div class="palette-foot">
+      <span><kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd> navigate</span>
+      <span><kbd class="kbd">↵</kbd> open</span>
+      <span id="paletteHint" class="muted"></span>
     </div>
   </div>
-</footer>
+</div>
 
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<footer class="footer">
+  <div class="container footer-grid">
+    <div>
+      <div class="brand brand--footer">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 100 100" fill="none"><rect width="100" height="100" rx="24" fill="currentColor"/><path d="M24 66 L44 46 L57 56 L78 30" stroke="#22c55e" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="brand-name">Dalal</span>
+      </div>
+      <p class="muted" id="footerDataNote">Market data is fetched from the exchange and provider APIs by
+        <b>server.py</b>; a static deployment reads the generated <b>js/snapshot.js</b>.</p>
+    </div>
+    <div class="footer-col">
+      <h4>Explore</h4>
+      <a href="#/">Market overview</a>
+      <a href="#/markets">All indices</a>
+      <a href="#/screener">Screener</a>
+      <a href="#/compare">Compare</a>
+      <a href="#/calendar">Calendar</a>
+    </div>
+    <div class="footer-col">
+      <h4>Sources</h4>
+      <a href="https://www.nseindia.com" target="_blank" rel="noopener noreferrer">NSE India</a>
+      <a href="https://www.bseindia.com" target="_blank" rel="noopener noreferrer">BSE India</a>
+      <a href="https://www.sebi.gov.in" target="_blank" rel="noopener noreferrer">SEBI</a>
+      <a href="#/settings#data">Data &amp; sources</a>
+    </div>
+    <div class="footer-col">
+      <h4>Good to know</h4>
+      <p class="muted">Fundamentals are shown only when the provider reports them; otherwise they read
+        <b>N/A</b>. Nothing here is investment advice.</p>
+    </div>
+  </div>
+  <div class="container footer-bottom">
+    <span>© <span id="year">2026</span> Dalal</span>
+    <span id="footerProvenance" class="muted"></span>
+  </div>
+</footer>
+<!-- Generated metadata + data. No prices live in these files except in
+     js/snapshot.js, which holds real provider output regenerated on a schedule
+     by .github/workflows/snapshot.yml. -->
 <script src="js/universe_nse.js" defer></script>
-<script src="js/data.js" defer></script>
-<script src="js/charts.js" defer></script>
+<script src="js/data/curated.js" defer></script>
 <script src="js/snapshot.js" defer></script>
+
+<!-- Core: formatting, identity, storage, transport, state, routing -->
+<script src="js/core/format.js" defer></script>
+<script src="js/core/symbols.js" defer></script>
+<script src="js/core/store.js" defer></script>
+<script src="js/core/api.js" defer></script>
+<script src="js/core/market.js" defer></script>
+<script src="js/core/router.js" defer></script>
+
+<!-- Reusable components -->
+<script src="js/components/ui.js" defer></script>
+<script src="js/components/charts.js" defer></script>
+
+<!-- Pages -->
+<script src="js/pages/dashboard.js" defer></script>
+<script src="js/pages/markets.js" defer></script>
+<script src="js/pages/stock.js" defer></script>
+<script src="js/pages/screener.js" defer></script>
+<script src="js/pages/compare.js" defer></script>
+<script src="js/pages/watchlist.js" defer></script>
+<script src="js/pages/calendar.js" defer></script>
+<script src="js/pages/settings.js" defer></script>
+
+<!-- Shell -->
 <script src="js/app.js" defer></script>
-<script src="js/live.js" defer></script>
 </body>
 </html>
+
